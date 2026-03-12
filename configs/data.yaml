@@ -1,0 +1,10 @@
+# YOLO11-seg 数据集配置
+# 鼻内窥镜手术器械分割
+
+path: /home/zjf/nasalendo_seg/dataset
+train: images/train
+val: images/val
+
+# 类别
+names:
+  0: instrument

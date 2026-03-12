@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+"""
+实时内窥镜分割脚本：从采集卡/摄像头实时获取内窥镜视频流，
+使用训练好的 YOLO11-seg 模型进行实时分割并显示。
+
+后处理流程:
+  1. 面积过滤: 剔除像素面积过小的噪点掩码
+  2. 形态学开运算: 消除掩码边缘毛刺，使轮廓更平滑
+  3. 反光过滤: 剔除掩码区域内平均亮度过高或饱和度过低的检测（强反光易被误检为器械）
+  4. 时序过滤: 仅当某区域连续 N 帧均被检测到（且置信度≥阈值）时才视为器械，抑制闪烁误检
+
+用法:
+    python inference/realtime_segment.py                     # 默认摄像头 /dev/video0
+    python inference/realtime_segment.py --video path.mp4    # 以视频文件为输入源
+    python inference/realtime_segment.py --camera 2          # 指定摄像头编号
+    python inference/realtime_segment.py --record            # 同时录制结果视频
+    python inference/realtime_segment.py --conf 0.5         # 调整置信度
+    按 'q' 退出, 按 'r' 开始/停止录制, 按 's' 截图 (视频模式下播完自动结束)
+"""
+
+import argparse
+import json
+import time
+import os
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+# ── 掩码颜色 (BGR) ──
+MASK_COLOR = (0, 200, 0)
+MASK_ALPHA = 0.45
+CONTOUR_COLOR = (0, 255, 0)
+CONTOUR_THICKNESS = 2
+
+# 时序匹配时 bbox IoU 低于此值不视为同一目标
+TRACK_IOU_THRESHOLD = 0.3
+
+
+def _box_iou(box_a, box_b):
+    """计算两个 bbox (x1,y1,x2,y2) 的 IoU。"""
+    ax1, ay1, ax2, ay2 = float(box_a[0]), float(box_a[1]), float(box_a[2]), float(box_a[3])
+    bx1, by1, bx2, by2 = float(box_b[0]), float(box_b[1]), float(box_b[2]), float(box_b[3])
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+        return 0.0
+    inter = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+    area_a = (ax2 - ax1) * (ay2 - ay1)
+    area_b = (bx2 - bx1) * (by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def extract_instrument_features(mask, frame_shape, fov_center=None):
+    """
+    对单个器械掩码提取 IBVS 用的特征点。
+
+    算法核心机制 (纯 PCA):
+      1. 使用 PCA (主成分分析) 找出器械掩码的主轴方向（第一主成分）和横轴方向（第二主成分）。
+      2. 将所有像素点投影到主轴上，找到两个极端点 end1 / end2，不做 tail/tip 区分。
+      3. 提取中部横向宽度，计算4个特征点 P1~P4。
+    """
+    # 取所有属于掩码的坐标 (x, y)
+    ys, xs = np.where(mask > 0)
+    if len(xs) < 20:
+        return None
+
+    pts = np.column_stack([xs.astype(np.float64), ys.astype(np.float64)])
+    centroid = pts.mean(axis=0)
+
+    # ── 1. PCA：协方差矩阵求主方向 ──
+    cov = np.cov(pts.T)
+    evals, evecs = np.linalg.eigh(cov)
+    # eigh 返回升序特征值；evecs[:,1] 是最大特征值对应的主方向（第一主成分）
+    principal_dir  = evecs[:, 1]          # 主轴方向
+    transverse_dir = evecs[:, 0]          # 横轴方向（与主轴垂直）
+
+    # ── 2. 投影到主轴，找两个极端点 ──
+    pts_centered = pts - centroid
+    proj_pca = pts_centered @ principal_dir
+
+    end1 = pts[np.argmin(proj_pca)]  # 主轴负向极端点
+    end2 = pts[np.argmax(proj_pca)]  # 主轴正向极端点
+
+    axis_vec = end2 - end1
+    axis_len = float(np.linalg.norm(axis_vec))
+    if axis_len < 10.0:
+        return None
+
+    # ── 3. 以 end1 为原点，在主轴方向上提取投影范围 ──
+    pts_from_end1 = pts - end1
+    proj_long  = pts_from_end1 @ principal_dir
+    proj_short = pts_from_end1 @ transverse_dir
+
+    long_max = float(proj_long.max())
+    long_min = float(proj_long.min())
+
+    P1 = end1 + long_max * principal_dir  # 主轴正向端点
+    P2 = end1 + long_min * principal_dir  # 主轴负向端点
+
+    # 取器械中部 50% 区域计算横向宽度，避免异形尖端干扰
+    long_range = long_max - long_min
+    proj_long_centered = proj_long - (long_max + long_min) / 2.0
+    central_mask_bool  = np.abs(proj_long_centered) <= long_range * 0.25
+
+    if central_mask_bool.sum() >= 5:
+        short_proj_central = proj_short[central_mask_bool]
+    else:
+        short_proj_central = proj_short
+
+    short_max = float(short_proj_central.max())
+    short_min = float(short_proj_central.min())
+
+    mid_long = (long_max + long_min) / 2.0
+    P3 = end1 + mid_long * principal_dir + short_max * transverse_dir
+    P4 = end1 + mid_long * principal_dir + short_min * transverse_dir
+
+    half_long    = axis_len
+    half_short   = max(abs(short_max), abs(short_min))
+    avg_width_px = float(short_max - short_min)
+
+    def to_int_pt(p):
+        return (int(round(float(p[0]))), int(round(float(p[1]))))
+
+    return {
+        "center":         to_int_pt(centroid),
+        "end1":           to_int_pt(end1),
+        "end2":           to_int_pt(end2),
+        "points":         [to_int_pt(P1), to_int_pt(P2), to_int_pt(P3), to_int_pt(P4)],
+        "principal_dir":  principal_dir,
+        "transverse_dir": transverse_dir,
+        "half_long":      half_long,
+        "half_short":     half_short,
+        "avg_width_px":   avg_width_px,
+    }
+
+
+def _draw_features(annotated, features):
+    """将 PCA 特征提取结果绘制到画面上（主轴、横轴及4个特征点）。"""
+    if features is None:
+        return
+
+    end1           = features["end1"]
+    end2           = features["end2"]
+    center         = features["center"]
+    points         = features["points"]
+    avg_width_px   = features["avg_width_px"]
+
+    COLOR_END_PT   = (255,   0, 255)   # 品红：主轴端点
+    COLOR_SIDE_PT  = (255, 200,   0)   # 金：横轴点
+    COLOR_AXIS_L   = ( 50, 255,  50)   # 亮绿：主轴
+    COLOR_AXIS_T   = ( 50, 200, 255)   # 青：横轴
+
+    P1, P2, P3, P4 = points
+
+    # ── 绘制主轴：end1 → end2 ──
+    cv2.line(annotated, end1, end2, COLOR_AXIS_L, 2)
+
+    # ── 绘制横轴：P3 → P4 ──
+    cv2.line(annotated, P3, P4, COLOR_AXIS_T, 2)
+
+    # ── 绘制主轴两端点 P1/P2 ──
+    for pt in [P1, P2]:
+        cv2.circle(annotated, pt, 7, COLOR_END_PT, -1)
+        cv2.circle(annotated, pt, 7, (0, 0, 0), 1)
+
+    # ── 绘制横轴两端点 P3/P4 ──
+    for pt in [P3, P4]:
+        cv2.circle(annotated, pt, 6, COLOR_SIDE_PT, -1)
+        cv2.circle(annotated, pt, 6, (0, 0, 0), 1)
+
+    # ── 中心点 ──
+    cv2.drawMarker(annotated, center, (0, 255, 0), cv2.MARKER_CROSS, 16, 2)
+
+    # ── 平均宽度标签 ──
+    width_text = f"W: {avg_width_px:.1f}px"
+    lx = int(np.clip(P3[0] + 10, 5, annotated.shape[1] - 120))
+    ly = int(np.clip(P3[1] - 8,  12, annotated.shape[0] - 5))
+    cv2.putText(annotated, width_text, (lx, ly),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
+
+
+def compute_fov_mask_from_json(config_path, frame_shape, boundary_margin=12):
+    """
+    通过读取计算好的 fov_config.json 配置，生成内窥镜 FOV 圆形掩码和其边缘环形区域。
+    用于取代以前通过累加 20 帧来猜测 FOV 边缘的做法，因为那并不精确。
+
+    Returns:
+        fov_mask      -- uint8 二値掩码，255=真实圆内视野
+        fov_boundary  -- uint8 二値掩码，255=真实 FOV 的边缘环形位置，用于检测器械根部 (tail)
+    """
+    if not os.path.exists(config_path):
+        print(f"❌ 未找到 FOV 配置文件: {config_path}")
+        print("   请先运行 `python inference/calculate_fov.py` 生成配置！")
+        return None, None
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        fov_cfg = json.load(f)
+    
+    # 优先读取 average 结果（因为最准）
+    if "average_frames" in fov_cfg:
+        cx = fov_cfg["average_frames"]["circle_center_x"]
+        cy = fov_cfg["average_frames"]["circle_center_y"]
+        r = fov_cfg["average_frames"]["circle_radius"]
+        print(f"\n🔍 读取由平均多帧测算得到的稳定视场圆心({cx:.1f}, {cy:.1f}), 半径={r:.1f}")
+    else:
+        # 兼容旧格式或提取失败退回的单层格式
+        cx = fov_cfg.get("circle_center_x", frame_shape[1] / 2)
+        cy = fov_cfg.get("circle_center_y", frame_shape[0] / 2)
+        r = fov_cfg.get("circle_radius", min(frame_shape[:2]) / 2)
+        print(f"\n🔍 读取视场圆心({cx:.1f}, {cy:.1f}), 半径={r:.1f}")
+
+    h, w = frame_shape[:2]
+    
+    # 1. 生成视野大圆的实体掩码 FOV
+    fov_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(fov_mask, (int(cx), int(cy)), int(r), 255, -1)
+
+    # 2. 生成紧贴着大圆边缘的一圈“边界环” FOV Boundary (用于寻根 Tail)
+    # 通过腐蚀内圆，再相减，就得到了完美的边缘环状带
+    erode_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (boundary_margin * 2 + 1, boundary_margin * 2 + 1))
+    fov_eroded = cv2.erode(fov_mask, erode_kernel)
+    fov_boundary = cv2.subtract(fov_mask, fov_eroded)
+
+    return fov_mask, fov_boundary, (cx, cy)
+
+
+def postprocess_and_draw(frame, result, min_area_ratio=0.005, morph_kernel_size=5,
+                         max_brightness=245, min_saturation=15,
+                         track_state=None, min_consecutive_frames=5,
+                         fov_center=None):
+    """
+    对 YOLO 分割结果进行后处理并绘制到画面上。
+    
+    后处理步骤:
+      1. 面积过滤: 掩码像素面积 < min_area_ratio * 图像面积 的检测被剔除
+      2. 形态学开运算: 先腐蚀后膨胀，消除边缘毛刺
+      3. 反光过滤: 掩码区域平均亮度过高或饱和度过低则剔除（强反光易被误检为器械）
+      4. 时序过滤: 若提供 track_state，仅绘制连续 min_consecutive_frames 帧均被检测到的区域
+      5. 特征提取: 椭圆拟合、4点提取、尖端识别、器械状态判断
+    
+    Args:
+        frame: 原始帧 (BGR)
+        result: YOLO 推理结果
+        min_area_ratio: 最小面积比例阈值 (相对于图像总面积)
+        morph_kernel_size: 形态学核大小
+        max_brightness: 掩码区域平均亮度上限，超过则视为反光剔除 (0–255，默认 245)
+        min_saturation: 掩码区域平均饱和度下限，低于则视为过曝/反光剔除 (0–255，默认 15)
+        track_state: 跨帧轨迹状态 dict，含 'tracks': [{'bbox', 'count'}, ...]，每帧传入并会被原地更新
+        min_consecutive_frames: 时序过滤所需连续帧数，≤1 时不启用时序过滤
+    
+    Returns:
+        annotated:    叠加了后处理掩码与特征点的帧
+        num_valid:    经过过滤后的有效检测数量
+        features_list: 每个有效器械对应的 extract_instrument_features 返回 dict 列表
+    """
+    annotated = frame.copy()
+    h, w = frame.shape[:2]
+    img_area = h * w
+    min_area = int(img_area * min_area_ratio)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, 
+                                       (morph_kernel_size, morph_kernel_size))
+    
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    use_temporal = (track_state is not None and min_consecutive_frames > 1)
+    if use_temporal and "tracks" not in track_state:
+        track_state["tracks"] = []
+
+    if result.masks is None or len(result.masks) == 0:
+        if use_temporal:
+            for t in track_state["tracks"]:
+                t["count"] = 0
+        return annotated, 0, []
+
+    # 获取所有 box（与 mask 索引对应）
+    boxes_xyxy = None
+    if result.boxes is not None and len(result.boxes) > 0:
+        xyxy = result.boxes.xyxy
+        boxes_xyxy = xyxy.cpu().numpy() if hasattr(xyxy, "cpu") else np.array(xyxy)
+
+    # ── 第一遍：收集通过面积+形态学+反光过滤的候选 (bbox, mask, conf, idx) ──
+    candidates = []
+    for i, mask_data in enumerate(result.masks.data):
+        mask = mask_data.cpu().numpy().astype(np.uint8)
+        if mask.shape[:2] != (h, w):
+            mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        area = cv2.countNonZero(mask)
+        if area < min_area:
+            continue
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        area = cv2.countNonZero(mask)
+        if area < min_area:
+            continue
+        # ── 只保留最大连通区域，去除掩码内分离的碎片 ──
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if num_labels > 2:   # 0=背景, 1..N=前景区域
+            largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            mask = np.where(labels == largest_label, np.uint8(1), np.uint8(0))
+        area = cv2.countNonZero(mask)
+        if area < min_area:
+            continue
+        mask_bool = mask > 0
+        mean_brightness = float(gray[mask_bool].mean())
+        mean_saturation = float(hsv[:, :, 1][mask_bool].mean())
+        if mean_brightness > max_brightness or mean_saturation < min_saturation:
+            continue
+        bbox = None
+        if boxes_xyxy is not None and i < len(boxes_xyxy):
+            bbox = tuple(map(float, boxes_xyxy[i]))
+        else:
+            xs, ys = np.where(mask > 0)
+            if len(xs) > 0:
+                x1, x2 = float(ys.min()), float(ys.max())
+                y1, y2 = float(xs.min()), float(xs.max())
+                bbox = (x1, y1, x2, y2)
+        if bbox is None:
+            continue
+        conf = 0.0
+        if result.boxes is not None and i < len(result.boxes):
+            conf = float(result.boxes.conf[i])
+        candidates.append({"bbox": bbox, "mask": mask, "conf": conf, "idx": i})
+
+    # ── 时序过滤：用 bbox IoU 与上一帧轨迹匹配，仅保留连续出现 ≥ min_consecutive_frames 的候选 ──
+    tracks = track_state["tracks"] if use_temporal else []
+    if use_temporal and len(candidates) == 0:
+        for t in tracks:
+            t["count"] = 0
+    if use_temporal:
+        # 本帧每个 track 最多匹配一个 candidate，每个 candidate 最多匹配一个 track
+        assigned_track = [False] * len(tracks)
+        assigned_cand = [False] * len(candidates)
+        for ti, t in enumerate(tracks):
+            best_j, best_iou = -1, TRACK_IOU_THRESHOLD
+            for j, c in enumerate(candidates):
+                if assigned_cand[j]:
+                    continue
+                iou = _box_iou(t["bbox"], c["bbox"])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_j = j
+            if best_j >= 0:
+                assigned_cand[best_j] = True
+                assigned_track[ti] = True
+                t["bbox"] = candidates[best_j]["bbox"]
+                t["count"] = t.get("count", 0) + 1
+                candidates[best_j]["track_count"] = t["count"]
+            else:
+                t["count"] = 0
+        for j, c in enumerate(candidates):
+            if not assigned_cand[j]:
+                c["track_count"] = 1
+                tracks.append({"bbox": c["bbox"], "count": 1})
+        # 只保留本帧出现且连续帧数达标的候选
+        to_draw = [c for c in candidates if c.get("track_count", 1) >= min_consecutive_frames]
+        # 未在本帧匹配到的 track 计数清零（已在上面 t["count"] = 0 处理）
+        # 轨迹过多时清理，只保留最近有匹配的以控制内存
+        if len(tracks) > 50:
+            track_state["tracks"] = [t for t in tracks if t.get("count", 0) > 0][:20]
+    else:
+        to_draw = candidates
+
+    # ── 单一器械约束：只保留置信度最高的一个候选 ──
+    if len(to_draw) > 1:
+        to_draw = [max(to_draw, key=lambda c: c["conf"])]
+
+    num_valid = len(to_draw)
+    features_list = []
+
+    for c in to_draw:
+        mask = c["mask"]
+        conf = c["conf"]
+
+        # ── 半透明掩码 ──
+        colored_mask = np.zeros_like(annotated)
+        colored_mask[mask > 0] = MASK_COLOR
+        annotated = cv2.addWeighted(annotated, 1.0, colored_mask, MASK_ALPHA, 0)
+
+        # ── 轮廓线 ──
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(annotated, contours, -1, CONTOUR_COLOR, CONTOUR_THICKNESS)
+
+        # ── 置信度标签 ──
+        if contours:
+            top_point = min(contours[0], key=lambda p: p[0][1])
+            tx, ty = top_point[0]
+            label = f"instrument {conf:.2f}"
+            cv2.putText(annotated, label, (int(tx), max(int(ty) - 8, 20)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, CONTOUR_COLOR, 2)
+
+        # ── 特征点提取 + 绘制 ──
+        features = extract_instrument_features(mask, frame.shape, fov_center=fov_center)
+        if features is not None:
+            _draw_features(annotated, features)
+            features_list.append(features)
+
+    return annotated, num_valid, features_list
+
+
+def main():
+    parser = argparse.ArgumentParser(description="YOLO11-seg 实时内窥镜分割")
+    parser.add_argument("--video", type=str, default=None,
+                        help="视频文件路径；指定后以视频为输入源，不再使用摄像头")
+    parser.add_argument("--camera", type=int, default=0,
+                        help="摄像头/采集卡编号 (默认: 0)，仅在未指定 --video 时生效")
+    parser.add_argument("--model", type=str,
+                        default="runs/segment/yolo11s_seg_formal/weights/best.pt",
+                        help="模型权重路径 (相对项目根)")
+    parser.add_argument("--conf", type=float, default=0.6,
+                        help="置信度阈值 (默认: 0.25)")
+    parser.add_argument("--iou", type=float, default=0.7,
+                        help="NMS IoU 阈值 (默认: 0.7)")
+    parser.add_argument("--imgsz", type=int, default=1024,
+                        help="推理图像尺寸 (默认: 1024)")
+    parser.add_argument("--device", type=str, default="0",
+                        help="推理设备 (默认: 0)")
+    parser.add_argument("--min-area", type=float, default=0.01,
+                        help="最小掩码面积比例 (默认: 0.005, 即图像面积的 0.5%%)")
+    parser.add_argument("--morph-kernel", type=int, default=5,
+                        help="形态学开运算核大小 (默认: 5)")
+    parser.add_argument("--max-brightness", type=int, default=245,
+                        help="反光过滤: 掩码区域平均亮度超过此值则剔除 (0–255, 默认 245, 设为 256 关闭)")
+    parser.add_argument("--min-saturation", type=int, default=15,
+                        help="反光过滤: 掩码区域平均饱和度低于此值则剔除 (0–255, 默认 15, 设为 0 关闭)")
+    parser.add_argument("--min-consecutive-frames", type=int, default=5,
+                        help="时序过滤: 仅当某区域连续 N 帧均被检测到才视为器械 (默认 5, 设为 1 关闭)")
+    parser.add_argument("--record", action="store_true",
+                        help="启动时立即开始录制 (以视频为输入时将自动保存)")
+    parser.add_argument("--no-display", action="store_true",
+                        help="不显示窗口 (仅录制模式)")
+    args = parser.parse_args()
+
+    # ── 路径设置 ──
+    project_root = Path(__file__).resolve().parent.parent
+    model_path = project_root / args.model
+    if not model_path.exists():
+        print(f"❌ 未找到模型权重: {model_path}")
+        print("   请先训练模型 (train.py) 或通过 --model 指定已有权重路径，例如:")
+        print("   python inference/realtime_segment.py --model path/to/best.pt")
+        return
+    results_dir = project_root / "results" / "from_video"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 加载模型 ──
+    print("=" * 60)
+    print("🔴 YOLO11-seg 实时内窥镜分割")
+    print("=" * 60)
+    print(f"模型: {args.model}")
+    if args.video:
+        print(f"输入: 视频 {args.video}")
+    else:
+        print(f"输入: 摄像头 /dev/video{args.camera}")
+    print(f"置信度: {args.conf}, IoU: {args.iou}, ImgSz: {args.imgsz}")
+    print(f"面积过滤: {args.min_area*100:.1f}%, 形态学核: {args.morph_kernel}x{args.morph_kernel}")
+    print(f"反光过滤: 亮度<{args.max_brightness}, 饱和度>{args.min_saturation}")
+    print(f"时序过滤: 连续 {args.min_consecutive_frames} 帧才显示 (设为 1 关闭)")
+    print(f"输出目录: {results_dir}")
+    print("=" * 60)
+
+    model = YOLO(str(model_path))
+
+    # ── 打开视频源（视频文件或摄像头）──
+    is_video_file = args.video is not None and args.video.strip() != ""
+    if is_video_file:
+        video_path = Path(args.video)
+        if not video_path.is_absolute():
+            video_path = project_root / video_path
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            print(f"❌ 无法打开视频文件: {video_path}")
+            return
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cam_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print(f"\n视频信息: {actual_w}x{actual_h} @ {cam_fps:.1f} FPS, 共 {total_frames} 帧")
+    else:
+        cap = cv2.VideoCapture(args.camera)
+        if not cap.isOpened():
+            print(f"❌ 无法打开摄像头: /dev/video{args.camera}")
+            return
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cam_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = None
+        print(f"\n摄像头信息: {actual_w}x{actual_h} @ {cam_fps:.1f} FPS")
+
+    # ── 录制器 ──
+    writer = None
+    is_recording = args.record or is_video_file
+
+    def start_recording():
+        nonlocal writer
+        if is_video_file:
+            input_name = Path(args.video).stem
+            out_path = results_dir / f"{input_name}_seg.avi"
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = results_dir / f"realtime_{timestamp}.avi"
+            
+        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+        writer = cv2.VideoWriter(str(out_path), fourcc, cam_fps, (actual_w, actual_h))
+        print(f"\n🔴 开始保存视频: {out_path}")
+        return out_path
+
+    def stop_recording():
+        nonlocal writer
+        if writer is not None:
+            writer.release()
+            writer = None
+            print("⬛ 停止录制")
+
+    if is_recording:
+        recording_path = start_recording()
+
+    # ── 主循环 ──
+    print("\n快捷键: [q] 退出 | [r] 录制开关 | [s] 截图\n")
+
+    frame_count = 0
+    fps_timer = time.time()
+    display_fps = 0.0
+    # 时序过滤用的跨帧轨迹状态（仅当 min_consecutive_frames > 1 时使用）
+    track_state = {} if args.min_consecutive_frames > 1 else None
+
+    # ── 读取内窥镜 FOV 正圆配置，并提取其圆心 ──
+    fov_center = None
+    fov_json_path = project_root / "results/fov_config.json"
+    if fov_json_path.exists():
+        _, _, fov_center = compute_fov_mask_from_json(
+            fov_json_path, frame_shape=(actual_h, actual_w, 3))
+    else:
+        print("\n⚠️ 警告: 没有找到 FOV 配置文件。寻找器械根部(Tail)将临时退化为使用矩形边框判别。")
+        print("   为提升准确度，建议先运行 `python inference/calculate_fov.py`")
+
+    try:
+        while True:
+            # 记录当前帧开始时间以控制播放速度
+            frame_start_time = time.time()
+            
+            ret, frame = cap.read()
+            if not ret:
+                if is_video_file:
+                    print("\n视频播放完毕")
+                    break
+                print("⚠️  无法读取帧，尝试重连...")
+                time.sleep(0.5)
+                continue
+
+            # 推理
+            results = model(frame, conf=args.conf, iou=args.iou, imgsz=args.imgsz,
+                            device=args.device, verbose=False)
+            result = results[0]
+
+            # 后处理 + 绘制 (面积/形态学/反光/时序过滤 + IBVS 特征提取)
+            annotated, num_valid, features_list = postprocess_and_draw(
+                frame, result,
+                min_area_ratio=args.min_area,
+                morph_kernel_size=args.morph_kernel,
+                max_brightness=args.max_brightness,
+                min_saturation=args.min_saturation,
+                track_state=track_state,
+                min_consecutive_frames=args.min_consecutive_frames,
+                fov_center=fov_center,
+            )
+
+            # 计算实时 FPS
+            frame_count += 1
+            elapsed = time.time() - fps_timer
+            if elapsed >= 1.0:
+                display_fps = frame_count / elapsed
+                frame_count = 0
+                fps_timer = time.time()
+
+            # 在画面上叠加状态信息
+            status_text = f"FPS: {display_fps:.1f}"
+            if is_video_file:
+                current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                status_text += f"  Frame: {current_frame}"
+                if total_frames and total_frames > 0:
+                    status_text += f"/{total_frames}"
+            if is_recording:
+                status_text += " | REC"
+                # 录制指示红点
+                cv2.circle(annotated, (actual_w - 30, 30), 12, (0, 0, 255), -1)
+
+            cv2.putText(annotated, status_text, (10, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+            # 检测数量 (过滤后)
+            det_text = f"Instruments: {num_valid}"
+            cv2.putText(annotated, det_text, (10, 75),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+
+            # IBVS 特征信息（取第一个器械显示到画面左下角）
+            if features_list:
+                feat = features_list[0]
+                end1 = feat["end1"]
+                end2 = feat["end2"]
+                pts  = feat["points"]
+                cv2.putText(annotated, f"E1:({end1[0]},{end1[1]})  E2:({end2[0]},{end2[1]})",
+                            (10, actual_h - 65),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 0, 255), 2)
+                avg_w = feat.get("avg_width_px", 0.0)
+                cv2.putText(annotated, f"Avg Width: {avg_w:.1f} px", (10, actual_h - 32),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 200, 0), 2)
+
+                pts_str = "  ".join(f"P{i+1}:({p[0]},{p[1]})" for i, p in enumerate(pts))
+                cv2.putText(annotated, pts_str, (10, actual_h - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 0), 1)
+
+            # 录制
+            if is_recording and writer is not None:
+                writer.write(annotated)
+
+            # 显示和控制播放速度
+            if not args.no_display:
+                cv2.imshow("Endoscope Segmentation (q=quit, r=record, s=screenshot)", annotated)
+
+                # 动态计算所需的 waitKey 延时，使播放速度逼近原视频 FPS
+                process_time = time.time() - frame_start_time
+                target_delay = 1.0 / cam_fps
+                wait_time_ms = int((target_delay - process_time) * 1000)
+                wait_time_ms = max(1, wait_time_ms)  # 至少延时 1ms 以让 GUI 刷新
+
+                key = cv2.waitKey(wait_time_ms) & 0xFF
+                if key == ord("q"):
+                    break
+                elif key == ord("r"):
+                    # 切换录制状态
+                    is_recording = not is_recording
+                    if is_recording:
+                        recording_path = start_recording()
+                    else:
+                        stop_recording()
+                elif key == ord("s"):
+                    # 截图
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    screenshot_path = results_dir / f"screenshot_{timestamp}.png"
+                    cv2.imwrite(str(screenshot_path), annotated)
+                    print(f"📸 截图已保存: {screenshot_path}")
+
+    except KeyboardInterrupt:
+        print("\n⚠️  用户中断 (Ctrl+C)")
+
+    # ── 清理 ──
+    stop_recording()
+    cap.release()
+    cv2.destroyAllWindows()
+
+    print(f"\n{'='*60}")
+    print("✅ 实时分割已结束")
+    print(f"{'='*60}")
+
+
+if __name__ == "__main__":
+    main()

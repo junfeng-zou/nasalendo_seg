@@ -1,0 +1,14 @@
+{
+    "frame_width": 1920,
+    "frame_height": 1080,
+    "single_frame": {
+        "circle_center_x": 959.8922729492188,
+        "circle_center_y": 534.74267578125,
+        "circle_radius": 594.1170654296875
+    },
+    "average_frames": {
+        "circle_center_x": 967.7061157226562,
+        "circle_center_y": 529.3329467773438,
+        "circle_radius": 599.432861328125
+    }
+}

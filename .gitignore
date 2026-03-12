@@ -1,0 +1,151 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Deep Learning & Training
+work_dirs/
+checkpoints/
+*.pth
+*.ckpt
+*.weights
+*.h5
+*.pb
+# YOLO/Ultralytics 等训练输出
+runs/
+**/runs/
+logs/
+wandb/
+lightning_logs/
+mlruns/
+outputs/
+
+# Data files & datasets
+data/
+dataset/
+data/raw_frames/
+data/raw_frames4/
+data/negative_sample/
+data/video/
+data/train/
+data/val/
+data/test/
+datasets/
+*.mp4
+*.avi
+*.mov
+*.mkv
+# 常见数据格式（按需取消注释）
+# *.npy
+# *.npz
+# *.csv
+# *.json
+# *.h5
+# *.hdf5
+
+# Image files (be careful with this - you may want to track some images)
+# *.jpg
+# *.jpeg
+# *.png
+# *.bmp
+
+# System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*~
+
+# Environment variables
+.env
+.env.local
+
+# Coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre
+.pyre/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.swp
+*.swo
+
+# MMSegmentation specific
+.mim/
+mmsegmentation/.mim/
+mmsegmentation/
+
+# ONNX models
+*.onnx
+
+*.pt
+
+# TensorBoard
+events.out.tfevents.*
+
+# 标注与帧数据（已由上方 data/dataset 覆盖，此处保留明确路径）
+annotations/
+frames/
+show/
+
+legacy/
+old_yolo11/
+
+
+
