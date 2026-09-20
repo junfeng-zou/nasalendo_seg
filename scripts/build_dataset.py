@@ -39,7 +39,7 @@ def clear_dataset():
     if DATASET_ROOT.exists():
         print(f"清空原有目录: {DATASET_ROOT}")
         shutil.rmtree(DATASET_ROOT)
-    
+
     # 重新创建必须的子目录
     for split in ["train", "val"]:
         (IMAGES_DIR / split).mkdir(parents=True, exist_ok=True)
@@ -49,19 +49,19 @@ def collect_files(directories):
     """收集目录下所有的图片及其对应的标签"""
     images = []
     labels = []
-    
+
     for d in directories:
         if not d.exists():
             print(f"[警告] 目录不存在: {d}")
             continue
-            
+
         for img_path in d.glob("*.png"):
             # 对应的 yolo txt 文件名
             txt_path = img_path.with_suffix(".txt")
             if txt_path.exists():
                 images.append(img_path)
                 labels.append(txt_path)
-                
+
     return images, labels
 
 def distribute_dataset(images, labels, txt_prefix=""):
@@ -69,47 +69,47 @@ def distribute_dataset(images, labels, txt_prefix=""):
     # 绑定打乱
     combined = list(zip(images, labels))
     random.shuffle(combined)
-    
+
     total = len(combined)
     train_count = int(total * TRAIN_RATIO)
-    
+
     train_data = combined[:train_count]
     val_data = combined[train_count:]
-    
+
     # 复制文件
     print(f"[{txt_prefix}] 总数: {total}, 分配到 train: {len(train_data)}, 分配到 val: {len(val_data)}")
-    
+
     def copy_data(data, split):
         for i, (img_src, txt_src) in enumerate(data):
             # 重新命名，保证一一对应 (例如: Positives_train_00001.png)
             new_name = f"{txt_prefix}_{split}_{i:05d}"
-            
+
             # 复制图片
             img_dst = IMAGES_DIR / split / f"{new_name}.png"
             shutil.copy2(img_src, img_dst)
-            
+
             # 复制/创建标签
             txt_dst = LABELS_DIR / split / f"{new_name}.txt"
-            
+
             # 严格确保所有的负样本标注为空文件
             if txt_prefix == "Negatives":
                 with open(txt_dst, 'w', encoding='utf-8') as f:
                     pass # 置空
             else:
                 shutil.copy2(txt_src, txt_dst)
-            
+
     copy_data(train_data, "train")
     copy_data(val_data, "val")
-    
+
     return len(train_data), len(val_data)
 
 def main():
     # 1. 设置随机种子保证可重复性
     random.seed(42)
-    
+
     # 2. 清空并重建目录
     clear_dataset()
-    
+
     # 3. 收集所有目标正样本
     print("\n--- 收集正样本 ---")
     pos_images, pos_labels = collect_files(POS_SOURCES)
@@ -118,20 +118,20 @@ def main():
     if num_pos == 0:
         print("[错误] 未找到任何正样本，停止执行！")
         return
-        
+
     # 4. 根据正样本数量决定负样本需求数量并比例抽样
     target_neg_count = num_pos // 3
     print(f"\n--- 收集负样本 ---")
     print(f"计划抽取负样本总数 (正样本的 1/3): {target_neg_count}")
-    
+
     # 使用所有所有可能的负样本来源
     all_neg_images = []
     all_neg_labels = []
-    
+
     # 获取各个负样本目录的文件
     neg_dir_files = {} # dict: path -> [(img, txt)]
     total_avail_neg = 0
-    
+
     for ndir in NEG_SOURCES:
         if not ndir.exists():
             continue
@@ -142,12 +142,12 @@ def main():
             random.shuffle(pairs)
             neg_dir_files[ndir] = pairs
             total_avail_neg += len(pairs)
-            
+
     print(f"总计可用的负样本池: {total_avail_neg}")
     if target_neg_count > total_avail_neg:
         print(f"[警告] 目标负样本数 ({target_neg_count}) 大于可用总数 ({total_avail_neg})！将使用所有可用负样本。")
         target_neg_count = total_avail_neg
-        
+
     # 按比例抽取负样本
     sampled_neg = []
     for ndir, pairs in neg_dir_files.items():
@@ -155,7 +155,7 @@ def main():
         dir_sample_count = int((len(pairs) / total_avail_neg) * target_neg_count)
         sampled_neg.extend(pairs[:dir_sample_count])
         print(f"  从 {ndir.name} 中抽取 {dir_sample_count} / {len(pairs)} 个")
-        
+
     # 由于由于整除取整，可能会有一点数量偏差，需要补齐或丢弃多余的
     diff = target_neg_count - len(sampled_neg)
     if diff > 0:
@@ -167,23 +167,23 @@ def main():
         random.shuffle(remainders)
         sampled_neg.extend(remainders[:diff])
         print(f"  通过零散补齐 {diff} 个样本使总数达到 {target_neg_count}")
-        
+
     # 将打包的 list 解开
     if sampled_neg:
         neg_images, neg_labels = zip(*sampled_neg)
         neg_images, neg_labels = list(neg_images), list(neg_labels)
     else:
         neg_images, neg_labels = [], []
-        
+
     print(f"实际抽取负样本数: {len(neg_images)}")
-    
+
     # 5. 打乱分配到 train / val (正负样本独立打乱确保比例均衡)
     print("\n--- 分配正样本到 Train/Val ---")
     pos_train_num, pos_val_num = distribute_dataset(pos_images, pos_labels, "Positives")
-    
+
     print("\n--- 分配负样本到 Train/Val ---")
     neg_train_num, neg_val_num = distribute_dataset(neg_images, neg_labels, "Negatives")
-    
+
     # 6. 总结
     print(f"\n==============================================")
     print(f"数据集构建完成！总包含 {len(pos_images) + len(neg_images)} 张图片")

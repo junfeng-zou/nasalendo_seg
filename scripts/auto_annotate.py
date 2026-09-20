@@ -57,19 +57,19 @@ def mask_to_shapes(result):
     ):
         if conf < CONF_THRESHOLD:
             continue
-        
+
         # mask_xy 是 numpy array，形状 (N, 2)
         # 用 cv2.approxPolyDP 减少多边形点数
         contour = np.array(mask_xy, dtype=np.float32)
         epsilon = APPROX_EPSILON_FACTOR * cv2.arcLength(contour, True)
         approx_contour = cv2.approxPolyDP(contour, epsilon, True)
-        
+
         # 将 numpy array 转换回 list
         points = [[float(point[0][0]), float(point[0][1])] for point in approx_contour]
-        
+
         if len(points) < 3:  # 多边形至少需要 3 个点
             continue
-            
+
         label = result.names[int(cls_id)]
         shapes.append({
             "label": label,
@@ -121,7 +121,7 @@ def main():
             with open(out_json, "w", encoding="utf-8") as f:
                 json.dump(anno, f, indent=2, ensure_ascii=False)
             shutil.copy2(img_path, out_img)
-            
+
             count += 1
 
         print(f"  处理了: {count} 帧 (包含有目标的和无目标的)")
@@ -134,4 +134,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
