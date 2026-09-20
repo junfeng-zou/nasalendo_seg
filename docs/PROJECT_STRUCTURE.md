@@ -33,3 +33,13 @@ nasalendo_seg/
 | 3. 标注 | `annotations/` | 将帧复制到此处，用 X-AnyLabeling 进行多边形标注 |
 | 4. 格式转换 + 拆分 | `dataset/` | JSON → YOLO seg txt，拆分为 train/val |
 | 5. 训练 | `runs/` | 使用 YOLO11-seg 进行实例分割训练 |
+
+## Distance-state research modules
+
+- `distance_state_classifier/`: RGB/ROI models, ordinal classification, training and inference.
+- `distance_state_classifier_endodac/`: depth-pretrained encoder adapters and appearance-consistency training.
+- `scripts/diagnose_distance_shortcuts.py`: paired foreground/background intervention diagnostics.
+- `tests/`: synthetic-fixture tests for preprocessing, geometry, losses and evaluation accounting.
+- `results/`: selected aggregate reports; private data and model weights are excluded.
+
+See [reproduction requirements](REPRODUCIBILITY.md) for environment and data requirements.
