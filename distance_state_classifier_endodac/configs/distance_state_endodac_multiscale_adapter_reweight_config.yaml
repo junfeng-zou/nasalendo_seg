@@ -1,0 +1,92 @@
+project:
+  name: distance_state_classifier_endodac
+  output_dir: distance_state_classifier_endodac/runs/endodac_encoder_multiscale_adapter_reweight_soft_392
+
+data:
+  train_csv: auto_labeling_project/data/final_dataset/train_labels.csv
+  val_csv: auto_labeling_project/data/final_dataset/val_labels.csv
+  test_csv: auto_labeling_project/data/final_dataset/test_labels.csv
+  image_column: image_path
+  label_column: label
+  classes:
+    - TooFar
+    - Good
+    - TooClose
+
+image:
+  input_size: 392
+  normalize:
+    mode: imagenet
+  crop:
+    enabled: false
+    x_left: 362
+    x_right: 1605
+    y_top: 0
+    y_bottom: 1080
+
+model:
+  name: endodac_encoder_classifier
+  backbone: endodac
+  pretrained: false
+  pretrained_checkpoint: distance_state_classifier_endodac/weights/endodac/EndoDAC_fullmodel/depth_model.pth
+  dropout: 0.25
+  hidden_dim: 512
+  feature_dim: auto
+  pool_type: mean
+  trainable_scope: adapter
+  last_blocks: 2
+  encoder:
+    backend: official
+    repo_path: distance_state_classifier_endodac/third_party/EndoDAC
+    pretrained_path: distance_state_classifier_endodac/third_party/EndoDAC/pretrained_model
+    backbone_size: base
+    lora_rank: 4
+    lora_type: dvlora
+    image_shape: [224, 280]
+    residual_block_indexes: [2, 5, 8, 11]
+    include_cls_token: true
+    feature_mode: multiscale_mean
+    simple_feature_dim: 384
+    timm_model_name: vit_small_patch14_dinov2.lvd142m
+    checkpoint: distance_state_classifier_endodac/weights/endodac/EndoDAC_fullmodel/depth_model.pth
+    strict_checkpoint: false
+
+train:
+  seed: 42
+  epochs: 60
+  batch_size: 8
+  num_workers: 0
+  amp: true
+  use_class_weights: true
+  # Manual weights reduce the current Good -> TooFar bias while keeping extra pressure on TooClose.
+  class_weights:
+    TooFar: 0.45
+    Good: 1.15
+    TooClose: 1.35
+  head_lr: 0.0003
+  encoder_lr: 0.000005
+  adapter_lr: 0.00001
+  weight_decay: 0.0001
+  patience: 15
+  save_every: 10
+  freeze_encoder_epochs: 5
+  grad_clip_norm: 1.0
+
+augmentation:
+  enabled: true
+  brightness: 0.15
+  contrast: 0.15
+  saturation: 0.10
+  hue: 0.03
+  blur_prob: 0.15
+  noise_prob: 0.15
+  rotate_deg: 5
+  translate_frac: 0.04
+  scale_frac: 0.08
+  horizontal_flip_prob: 0.0
+
+inference:
+  confidence_threshold: 0.55
+  smoothing_window: 5
+  min_state_count: 3
+  prefer_tooclose: true
