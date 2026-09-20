@@ -59,6 +59,7 @@ outputs/
 # Data files & datasets
 data/
 dataset/
+yolo11_seg_old_train_dataset/
 data/raw_frames/
 data/raw_frames4/
 data/negative_sample/
@@ -147,5 +148,90 @@ show/
 legacy/
 old_yolo11/
 
+# 本地数据、人工标注与采集记录（保留项目代码及 results 中的报告）
+/annotation_projects/
+/data_record/
+/sam2_review_annotator_package_part*/
+/review_status*.jsonl
+/larger_surgical_video_dataset_training_20260712/training_results/
+/larger_surgical_video_dataset_training_20260712/output_videos/
 
+# 图像默认不上传，包括原始帧、掩膜、ROI 和预览图。
+# 如需公开报告插图，请审核后在文件末尾添加精确路径例外：
+# !/docs/assets/approved_diagram.png
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[pP][nN][gG]
+*.[bB][mM][pP]
+*.[tT][iI][fF]
+*.[tT][iI][fF][fF]
+*.[wW][eE][bB][pP]
+*.[gG][iI][fF]
+*.[hH][eE][iI][cC]
+*.[hH][eE][iI][fF]
+*.[dD][cC][mM]
 
+# 视频（兼容大写和混合大小写扩展名）
+*.[mM][pP]4
+*.[aA][vV][iI]
+*.[mM][oO][vV]
+*.[mM][kK][vV]
+*.[mM]4[vV]
+*.[mM][pP][gG]
+*.[mM][pP][eE][gG]
+*.[wW][mM][vV]
+*.[fF][lL][vV]
+*.[wW][eE][bB][mM]
+# .ts 也用于 TypeScript，仅在视频目录中忽略
+**/videos/**/*.[tT][sS]
+**/video/**/*.[tT][sS]
+*.[mM][tT][sS]
+*.[mM]2[tT][sS]
+*.[rR][oO][sS][bB][aA][gG]
+*.bag
+*.mcap
+
+# 特征缓存、深度数组及其他模型产物
+*.npy
+*.npz
+*.hdf5
+*.safetensors
+*.engine
+*.plan
+*.tflite
+*.pkl
+*.pickle
+
+# 数据集/标注交付包和本地压缩备份
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.tar.xz
+*.7z
+*.rar
+
+# 本地凭据（保留可共享的环境变量模板）
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+
+# 本地备份和包含病例身份信息的统计表
+*.bak
+/鼻窦炎视频_病例日期编号姓名统计.xlsx
+
+# Local research manifests, dependencies and working notes
+/distance_state_classifier/splits/
+/distance_state_classifier_endodac/mask_cache/
+**/third_party/
+/CLAUDE.md
+/AGENTS.md
+/.agents/
+/.codex/
+/prompt.md
+/*implementation-spec.md
+/distance_state_classifier_endodac/*_plan.md
