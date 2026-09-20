@@ -1,0 +1,70 @@
+project:
+  name: distance_state_classifier
+  output_dir: distance_state_classifier/runs/convnext_tiny_384
+
+data:
+  train_csv: auto_labeling_project/data/final_dataset/train_labels.csv
+  val_csv: auto_labeling_project/data/final_dataset/val_labels.csv
+  test_csv: auto_labeling_project/data/final_dataset/test_labels.csv
+  image_column: image_path
+  label_column: label
+  classes:
+    - TooFar
+    - Good
+    - TooClose
+
+image:
+  input_size: 384
+  # Use this crop only when the input image is raw 1920x1080.
+  crop:
+    enabled: false
+    x_left: 362
+    x_right: 1605
+    y_top: 0
+    y_bottom: 1080
+
+model:
+  # Use timm pretrained models with the "timm:<model_name>" prefix.
+  # Good first choices:
+  #   timm:convnext_tiny
+  #   timm:tf_efficientnetv2_s
+  #   timm:resnet18
+  name: timm:convnext_tiny
+  pretrained: true
+  dropout: 0.2
+
+train:
+  seed: 42
+  epochs: 60
+  batch_size: 16
+  num_workers: 0
+  # For timm pretrained models, use a small backbone LR and a larger classifier-head LR.
+  lr: 0.0003
+  head_lr: 0.0003
+  backbone_lr: 0.00001
+  weight_decay: 0.0001
+  use_class_weights: true
+  amp: true
+  patience: 15
+  save_every: 10
+  freeze_backbone_epochs: 5
+  grad_clip_norm: 1.0
+
+augmentation:
+  enabled: true
+  brightness: 0.15
+  contrast: 0.15
+  saturation: 0.10
+  hue: 0.03
+  blur_prob: 0.15
+  noise_prob: 0.15
+  rotate_deg: 5
+  translate_frac: 0.04
+  scale_frac: 0.08
+  horizontal_flip_prob: 0.0
+
+inference:
+  confidence_threshold: 0.55
+  smoothing_window: 5
+  min_state_count: 3
+  prefer_tooclose: true

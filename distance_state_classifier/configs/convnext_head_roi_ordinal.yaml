@@ -1,0 +1,75 @@
+project:
+  name: distance_state_classifier
+  output_dir: distance_state_classifier/runs/convnext_head_roi_ordinal_20260907
+data:
+  train_csv: auto_labeling_project/data/final_dataset/train_labels.csv
+  val_csv: auto_labeling_project/data/final_dataset/val_labels.csv
+  test_csv: auto_labeling_project/data/final_dataset/test_labels.csv
+  image_column: image_path
+  label_column: label
+  classes:
+  - TooFar
+  - Good
+  - TooClose
+image:
+  input_size: 384
+  crop:
+    enabled: false
+    x_left: 362
+    x_right: 1605
+    y_top: 0
+    y_bottom: 1080
+model:
+  name: convnext_head_roi_ordinal
+  backbone: convnext_tiny
+  grid_size: 2
+  hidden_dim: 256
+  dropout: 0.2
+  pretrained_file: weights/convnext_tiny.in12k_ft_in1k.safetensors
+train:
+  seed: 42
+  epochs: 60
+  batch_size: 32
+  num_workers: 0
+  lr: 0.0003
+  head_lr: 0.0003
+  backbone_lr: 1.0e-05
+  weight_decay: 0.0001
+  use_class_weights: true
+  amp: true
+  patience: 15
+  save_every: 10
+  freeze_backbone_epochs: 5
+  grad_clip_norm: 1.0
+augmentation:
+  enabled: true
+  brightness: 0.15
+  contrast: 0.15
+  saturation: 0.1
+  hue: 0.03
+  blur_prob: 0.15
+  noise_prob: 0.15
+  rotate_deg: 0.0
+  translate_frac: 0.0
+  scale_frac: 0.0
+  horizontal_flip_prob: 0.0
+inference:
+  confidence_threshold: 0.55
+  smoothing_window: 5
+  min_state_count: 3
+  prefer_tooclose: true
+experiment:
+  name: head_roi_spatial_ordinal
+  baseline_checkpoint: distance_state_classifier/runs/final_convnext_tiny_384_v2/best.pt
+  initialization: ImageNet pretrained cache; no warm-start from distance classifier
+    A
+roi:
+  cache_dir: results/convnext_head_roi_cache_20260907
+  mask_cache: distance_state_classifier_endodac/mask_cache/yolo11s_seg_formal
+  side_fraction: 0.4
+  backshift_fraction: 0.2
+  calibration_frames: 8
+  min_mask_pixels: 20
+  min_component_fraction: 0.6
+  min_geometry_score: 0.45
+  min_visible_fraction: 0.5
