@@ -6,6 +6,10 @@ YOLO11-seg 手术器械分割 - 正式训练脚本。
   - 动态模糊 (motion blur)
   - 颜色抖动，尤其红色通道 (出血模拟)
 
+数据集路径由 configs/data.yaml 配置；请先指向本地数据集。
+距离状态分类训练入口见 distance_state_classifier/scripts/train.py，
+依赖和复现说明见 docs/REPRODUCIBILITY.md。
+
 用法:
     python train.py                          # 默认: yolo11s-seg, imgsz=1024
     python train.py --imgsz 640              # 更小图像尺寸 (更快训练)
